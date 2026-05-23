@@ -2,6 +2,12 @@
 
 A collection of skills for AI agents. Each skill is a self-contained directory that can be copied to your agent's skills directory.
 
+## Example Output
+
+![Example Mindmap](examples/example_chapter4.png)
+
+This is an example result from pdf2mindmap.
+
 ## Skills
 
 ### pdf2mindmap
