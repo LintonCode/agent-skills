@@ -2,6 +2,20 @@
 
 Convert PDF documents into beautiful, interactive mind maps with LLM-powered summarization.
 
+## Example Output
+
+Here's an example of a mindmap generated from a Chinese textbook chapter:
+
+![Example Mindmap](examples/example_chapter4.png)
+
+**Interactive HTML version:** [View Example](examples/example_chapter4.html)
+
+This example shows Chapter 4 (知识产权主体 - Intellectual Property Subjects) with:
+- Priority markers (★★★ core, ★★ important, ★ supplementary)
+- Memory indicators (◯) for key concepts
+- Hierarchical structure with 3 levels
+- 8K resolution (7680×4320) PNG export
+
 ## Features
 
 - **Automatic chapter detection** — Uses PDF bookmarks (TOC) or font-size heuristics
@@ -59,7 +73,7 @@ mindmap_<pdf_name>/
 
 The included `html2png.py` script handles:
 - Chinese font rendering (injects Google Noto Sans SC)
-- 8K viewport (7680x4320) to avoid truncation
+- 8K viewport (7680×4320) to avoid truncation
 - D3.js animation completion (10s wait)
 - Batch conversion of all HTML files
 
