@@ -11,6 +11,7 @@ description: Convert PDF documents into interactive mind maps using PyMuPDF for 
 
 Convert PDF documents into interactive mind maps using:
 - **PyMuPDF** (pymupdf) — high-performance PDF text extraction with font-size-aware heading detection
+- **RapidOCR** (rapidocr-onnxruntime) — OCR for scanned PDFs (automatic detection)
 - **markmap-cli** — convert Markdown to interactive mind map HTML
 - **LLM summarization** — always used to read and summarize chapter content for rich mind maps
 - **pyppeteer** — render markmap HTML to high-quality PNG with Chinese font support
@@ -19,17 +20,46 @@ The pipeline handles large PDFs with multiple chapters by generating:
 1. Individual chapter mind maps (with LLM-enhanced content)
 2. An overall document mind map showing all chapter relationships
 
-## Prerequisites
+## Installation
 
-### Python Dependencies
+### From GitHub (recommended)
 ```bash
+# Clone the agent-skills repository
+git clone https://github.com/LintonCode/agent-skills.git
+
+# Copy the skill to your agent's skills directory
+cp -r agent-skills/pdf2mindmap ~/.hermes/skills/pdf2mindmap
+
+# Install dependencies
 pip install pymupdf pyppeteer
-```
-
-### Node.js Dependencies
-```bash
 npm install -g markmap-cli
 ```
+
+### Dependencies
+- **Python:** `pymupdf`, `pyppeteer`
+- **Node.js:** `markmap-cli`
+- **OCR (for scanned PDFs):** `rapidocr-onnxruntime`
+
+### OCR Support (Scanned PDFs)
+
+If the PDF is scanned (image-based), the pipeline automatically detects it and uses RapidOCR to extract text:
+
+```bash
+# Install OCR dependency
+pip install rapidocr-onnxruntime
+
+# Run the pipeline (OCR is automatic)
+python3 pdf2mindmap.py scanned_document.pdf
+```
+
+The script will:
+1. Detect if the PDF is scanned by sampling pages
+2. Convert pages to images (300 DPI)
+3. Use RapidOCR to extract text from each page
+4. Save OCR text to `text/` directory
+5. Continue with chapter detection and LLM summarization
+
+**Note:** OCR is slower than text extraction but works for scanned documents.
 
 ### Verify Installation
 ```bash
@@ -75,6 +105,8 @@ print(result["html_paths"])           # Dict: markdown_filename -> html_path
 ```
 
 ## Output Structure
+
+**Standardized output directory structure with separate folders for markdown, output files, and raw text.**
 
 ```
 {output_dir}/
@@ -128,7 +160,34 @@ Key PyMuPDF APIs:
 - `page.get_text("text")` — plain text only
 - `page.get_text("words")` — word-level extraction with positions
 
-### Step 2: Detect Chapter Structure
+### Step 2: Detect if PDF is Scanned (OCR Check)
+
+The script automatically checks if the PDF is scanned by sampling pages:
+
+```python
+def is_scanned_pdf(pdf_path: str, sample_pages: int = 5) -> bool:
+    """Check if PDF is scanned (image-based) by sampling pages."""
+    doc = fitz.open(pdf_path)
+    pages_to_check = min(sample_pages, doc.page_count)
+    
+    textless_pages = 0
+    for i in range(pages_to_check):
+        page = doc[i]
+        text = page.get_text("text").strip()
+        if len(text) < 50:  # Very little text = likely scanned
+            textless_pages += 1
+    
+    doc.close()
+    return textless_pages >= pages_to_check * 0.8
+```
+
+If the PDF is scanned:
+1. Convert pages to images (300 DPI)
+2. Use RapidOCR to extract text from each page
+3. Save OCR text to `text/` directory
+4. Continue with chapter detection using OCR text
+
+### Step 3: Detect Chapter Structure
 
 Two strategies, used in order of priority:
 
@@ -151,11 +210,13 @@ median_size = sorted(font_sizes)[len(font_sizes) // 2]
 heading_threshold = median_size * 1.5  # 50% larger than median
 ```
 
-### Step 3: Extract Chapter Text
+### Step 4: Extract Chapter Text
 
 The script extracts raw text for each chapter and saves it to `text/` directory. These files are the input for LLM summarization.
 
-### Step 4: LLM Summarization (AGENT TASK)
+For scanned PDFs, the text is extracted using RapidOCR. For text-based PDFs, the text is extracted directly using PyMuPDF.
+
+### Step 5: LLM Summarization (AGENT TASK)
 
 **This is where you (the agent) come in.** For each chapter's `.txt` file, read the full text and generate a structured Markdown summary using the LLM.
 
@@ -202,7 +263,7 @@ The script extracts raw text for each chapter and saves it to `text/` directory.
 5. Run markmap to generate HTML in `output/` directory
 6. Run `html2png.py --batch` to convert all HTML to PNG
 
-### Step 5: Generate Mind Maps with markmap
+### Step 6: Generate Mind Maps with markmap
 
 ```bash
 # Generate mind map from Markdown
@@ -214,7 +275,7 @@ Options:
 - `--no-open` — don't open in browser after generation
 - `-o <file>` — specify output filename
 
-### Step 6: Convert HTML to PNG
+### Step 7: Convert HTML to PNG
 
 ```bash
 # Batch convert all HTML files
@@ -329,4 +390,5 @@ For large PDFs (100+ pages), the pipeline:
 - **HTML to PNG**: `~/.hermes/skills/pdf2mindmap/scripts/html2png.py` (pyppeteer, with font injection)
 - **Skill file**: `~/.hermes/skills/pdf2mindmap/SKILL.md`
 - **PNG troubleshooting**: `references/html-to-png.md` (detailed HTML→PNG conversion guide)
-- **GitHub**: https://github.com/LintonCode/pdf2mindmap (MIT licensed, public)
+- **Summarization workflow**: `references/summarization-workflow.md` (LLM summarization prompt and examples)
+- **GitHub repository**: https://github.com/LintonCode/agent-skills

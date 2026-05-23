@@ -5,13 +5,19 @@ PDF to Mindmap Pipeline
 Uses PyMuPDF to parse PDFs, then the agent's LLM to summarize chapters,
 and markmap-cli to generate interactive mind maps.
 
+Supports both text-based and scanned PDFs:
+- Text-based PDFs: Extract text directly using PyMuPDF
+- Scanned PDFs: Convert pages to images and use RapidOCR for text extraction
+
 Workflow:
   1. Parse PDF with PyMuPDF (extract text blocks + TOC)
-  2. Detect chapter structure (from bookmarks/TOC or font-size heuristics)
-  3. Extract raw text for each chapter and save to text/ directory
-  4. AGENT: Read each chapter's text and summarize with LLM into structured Markdown
-  5. Generate markmap HTML for each summarized chapter + overall mind map
-  6. Convert HTML to PNG using pyppeteer (with Chinese font support)
+  2. Detect if PDF is scanned (image-based)
+  3. If scanned, use RapidOCR to extract text from images
+  4. Detect chapter structure (from bookmarks/TOC or font-size heuristics)
+  5. Extract raw text for each chapter and save to text/ directory
+  6. AGENT: Read each chapter's text and summarize with LLM into structured Markdown
+  7. Generate markmap HTML for each summarized chapter + overall mind map
+  8. Convert HTML to PNG using pyppeteer (with Chinese font support)
 
 Output structure:
   {output_dir}/
@@ -28,6 +34,7 @@ using the LLM, then generates the final Markdown and mind maps.
 Dependencies:
   pip install pymupdf pyppeteer
   npm install -g markmap-cli
+  pip install rapidocr-onnxruntime  # For scanned PDFs
 """
 
 import sys
@@ -83,6 +90,120 @@ def parse_pdf(pdf_path: str) -> Tuple[List[Dict], Dict[int, List[Dict]], int]:
 
     doc.close()
     return toc, page_blocks, page_count
+
+
+def is_scanned_pdf(pdf_path: str, sample_pages: int = 5) -> bool:
+    """
+    Check if a PDF is scanned (image-based) by sampling pages.
+    
+    A PDF is considered scanned if:
+    - Most pages have very little extractable text (< 50 chars per page)
+    - Pages contain images but no text layers
+    
+    Args:
+        pdf_path: Path to the PDF file
+        sample_pages: Number of pages to sample (default: 5)
+    
+    Returns:
+        True if the PDF appears to be scanned, False otherwise
+    """
+    doc = fitz.open(pdf_path)
+    total_pages = doc.page_count
+    pages_to_check = min(sample_pages, total_pages)
+    
+    textless_pages = 0
+    
+    for i in range(pages_to_check):
+        page = doc[i]
+        text = page.get_text("text").strip()
+        
+        # If page has very little text, it's likely scanned
+        if len(text) < 50:
+            textless_pages += 1
+    
+    doc.close()
+    
+    # If most sampled pages have little text, consider it scanned
+    return textless_pages >= pages_to_check * 0.8
+
+
+def run_ocr(pdf_path: str, output_dir: str, dpi: int = 300) -> Dict[int, str]:
+    """
+    Run OCR on a scanned PDF using RapidOCR.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        output_dir: Directory to save OCR results
+        dpi: Resolution for image conversion (default: 300)
+    
+    Returns:
+        Dict mapping page number to extracted text
+    """
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        print("[ERROR] rapidocr-onnxruntime is not installed.")
+        print("Install it with: pip install rapidocr-onnxruntime")
+        sys.exit(1)
+    
+    ocr = RapidOCR()
+    doc = fitz.open(pdf_path)
+    page_texts = {}
+    
+    zoom = dpi / 72  # 72 is the default DPI
+    mat = fitz.Matrix(zoom, zoom)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        pix = page.get_pixmap(matrix=mat)
+        
+        # Save image temporarily
+        img_path = os.path.join(output_dir, f"temp_page_{page_num + 1}.png")
+        pix.save(img_path)
+        
+        print(f"  OCR processing page {page_num + 1}...")
+        
+        try:
+            result, _ = ocr(img_path)
+            
+            if result:
+                # Sort results by position (top to bottom)
+                result.sort(key=lambda x: x[0][0][1])  # Sort by y-coordinate
+                
+                # Extract text lines
+                lines = [item[1] for item in result]
+                text = "\n".join(lines)
+            else:
+                text = ""
+            
+            page_texts[page_num] = text
+            
+            # Save individual page text
+            txt_path = os.path.join(output_dir, f"_text_page_{page_num + 1}.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            
+            # Clean up temp image
+            os.remove(img_path)
+        
+        except Exception as e:
+            print(f"  [WARN] OCR failed for page {page_num + 1}: {e}")
+            page_texts[page_num] = ""
+    
+    doc.close()
+    
+    # Save combined text
+    combined_path = os.path.join(output_dir, "_ocr_combined.txt")
+    with open(combined_path, "w", encoding="utf-8") as f:
+        for page_num in sorted(page_texts.keys()):
+            f.write(f"\n=== Page {page_num + 1} ===\n\n")
+            f.write(page_texts[page_num])
+    
+    print(f"OCR complete! Text saved to: {output_dir}")
+    
+    return page_texts
 
 
 def detect_headings_from_fontsize(blocks: List[Dict], threshold_ratio: float = 1.5) -> List[Dict]:
@@ -256,14 +377,38 @@ def extract_chapter_text(
     return "\n".join(lines)
 
 
+def extract_chapter_text_from_ocr(
+    chapter: Dict,
+    page_texts: Dict[int, str],
+    skip_titles: set,
+) -> str:
+    """
+    Extract text for a chapter from OCR results.
+    Returns clean text string.
+    """
+    lines = []
+    for page_num in range(chapter["start_page"], min(chapter["end_page"], len(page_texts))):
+        text = page_texts.get(page_num, "").strip()
+        if text and text not in skip_titles:
+            lines.append(text)
+    return "\n".join(lines)
+
+
 def save_chapter_texts(
     chapters: List[Dict],
     page_blocks: Dict[int, List[Dict]],
     text_dir: str,
+    page_texts: Optional[Dict[int, str]] = None,
 ) -> List[Dict]:
     """
     Extract raw text for each chapter and save to text/ directory.
     Returns list of chapter dicts with 'text_file' path added.
+    
+    Args:
+        chapters: List of chapter dicts
+        page_blocks: Dict mapping page_num -> list of text blocks (for text-based PDFs)
+        text_dir: Directory to save text files
+        page_texts: Dict mapping page_num -> text (for scanned PDFs, from OCR)
     """
     os.makedirs(text_dir, exist_ok=True)
     text_files = []
@@ -277,7 +422,12 @@ def save_chapter_texts(
                 collect_titles(s)
         collect_titles(chapter)
 
-        text = extract_chapter_text(chapter, page_blocks, all_titles)
+        # Use OCR text if available, otherwise use page blocks
+        if page_texts:
+            text = extract_chapter_text_from_ocr(chapter, page_texts, all_titles)
+        else:
+            text = extract_chapter_text(chapter, page_blocks, all_titles)
+        
         safe_title = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff\s-]', '', chapter["title"]).strip().replace(' ', '-')[:50]
         text_filename = f"_text_{safe_title}.txt"
         text_path = os.path.join(text_dir, text_filename)
@@ -342,6 +492,10 @@ def pdf_to_mindmap(
 ) -> Dict[str, str]:
     """
     Full pipeline: PDF -> Parse -> Extract text -> (AGENT summarizes) -> Markdown -> Mindmap
+    
+    Supports both text-based and scanned PDFs:
+    - Text-based PDFs: Extract text directly using PyMuPDF
+    - Scanned PDFs: Convert pages to images and use RapidOCR for text extraction
 
     Returns dict with:
       - output_dir
@@ -350,6 +504,7 @@ def pdf_to_mindmap(
       - chapters (list with text_file paths for LLM summarization)
       - chapter_text_files (list of .txt paths to summarize)
       - html_paths (filled after agent generates markdowns)
+      - is_scanned (True if PDF was detected as scanned)
     """
     pdf_path = os.path.abspath(pdf_path)
     if not os.path.exists(pdf_path):
@@ -377,33 +532,46 @@ def pdf_to_mindmap(
     print(f"  output/:   {output_html_dir}\n")
 
     # Step 1: Parse PDF
-    print("[1/5] Parsing PDF with PyMuPDF...")
+    print("[1/6] Parsing PDF with PyMuPDF...")
     toc, page_blocks, page_count = parse_pdf(pdf_path)
     print(f"  Pages: {page_count}")
     print(f"  TOC entries: {len(toc)}")
 
-    # Step 2: Build chapter structure
-    print("[2/5] Detecting chapter structure...")
+    # Step 2: Check if PDF is scanned
+    print("[2/6] Checking if PDF is scanned...")
+    is_scanned = is_scanned_pdf(pdf_path)
+    print(f"  Is scanned: {is_scanned}")
+    
+    page_texts = None
+    if is_scanned:
+        print("  PDF appears to be scanned (image-based).")
+        print("  Running OCR to extract text...")
+        page_texts = run_ocr(pdf_path, text_dir)
+    else:
+        print("  PDF contains text layers (not scanned).")
+
+    # Step 3: Build chapter structure
+    print("[3/6] Detecting chapter structure...")
     chapters = build_chapter_structure(toc, page_blocks, page_count)
     print(f"  Chapters detected: {len(chapters)}")
     for ch in chapters:
         print(f"    - {'#' * ch['level']} {ch['title']} (pages {ch['start_page']}-{ch['end_page']})")
 
-    # Step 3: Extract text and save to files
-    print("[3/5] Extracting chapter text...")
-    text_files = save_chapter_texts(chapters, page_blocks, text_dir)
+    # Step 4: Extract text and save to files
+    print("[4/6] Extracting chapter text...")
+    text_files = save_chapter_texts(chapters, page_blocks, text_dir, page_texts)
     print(f"  Saved {len(text_files)} chapter text files to: {text_dir}")
 
-    # Step 4: AGENT SUMMARIZES (call delegate_task for each chapter)
-    print("[4/5] === AGENT TASK: Summarize each chapter using LLM ===")
+    # Step 5: AGENT SUMMARIZES (call delegate_task for each chapter)
+    print("[5/6] === AGENT TASK: Summarize each chapter using LLM ===")
     print("  Read each .txt file in the text/ directory and generate")
     print("  a structured Markdown summary with ★ priority and ◯ memory markers.")
     print("  Save summaries to chapter_<safe_title>.md in markdown/ directory.")
     print("  Then generate document_overall.md from all summaries.")
     print("  After that, run markmap to generate HTML files in output/ directory.")
 
-    # Step 5: Generate mindmaps (after agent creates markdowns)
-    print("[5/5] Generating mindmaps with markmap...")
+    # Step 6: Generate mindmaps (after agent creates markdowns)
+    print("[6/6] Generating mindmaps with markmap...")
     # Find all chapter markdowns (agent-created) and overall
     markdown_files = {}
     for f in os.listdir(markdown_dir):
@@ -432,6 +600,7 @@ def pdf_to_mindmap(
         "chapters": chapters,
         "chapter_text_files": text_files,
         "html_paths": html_paths,
+        "is_scanned": is_scanned,
     }
 
 
@@ -474,10 +643,11 @@ def main():
         print("")
         print("Workflow:")
         print("  1. Script extracts PDF text and chapter structure")
-        print("  2. Agent (you) reads each chapter's .txt and summarizes with LLM")
-        print("  3. Agent saves summaries as .md files in markdown/ directory")
-        print("  4. Script generates mindmap HTML in output/ directory")
-        print("  5. Run html2png.py output/ --batch to convert to PNG")
+        print("  2. If PDF is scanned, uses RapidOCR to extract text")
+        print("  3. Agent (you) reads each chapter's .txt and summarizes with LLM")
+        print("  4. Agent saves summaries as .md files in markdown/ directory")
+        print("  5. Script generates mindmap HTML in output/ directory")
+        print("  6. Run html2png.py output/ --batch to convert to PNG")
         sys.exit(1)
 
     pdf_path = sys.argv[1]
